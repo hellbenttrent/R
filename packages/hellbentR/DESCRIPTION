@@ -1,0 +1,16 @@
+Package: hellbentR
+Type: Package
+Title: R For You
+Version: 0.1.0
+Authors@R: c(
+    person(
+      "Hellbent", "Trent",
+      email = "trent.tagestad@wsu.edu",
+      role = c("aut", "cre")
+    )
+  )
+Description: Statistical inference according to Trent.
+    Continuation lines should be indented.
+License: Apache License 2.0
+Encoding: UTF-8
+LazyData: true
