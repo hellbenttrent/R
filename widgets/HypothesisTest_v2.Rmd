@@ -1,0 +1,768 @@
+---
+pagetitle: "HypothesisTest"
+output:
+  ioslides_presentation:
+    widescreen: true
+    pandoc_args: ["--variable=include-before:<!-- HypothesisTest is a single slide, so the title slide is omitted. -->"]
+runtime: shiny
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(package = "shiny")
+```
+
+```{r catalog, include = FALSE}
+# -----------------------------------------------------------------------------
+# Catalog of built-in datasets and their quantitative attributes.
+# Categories stored as numbers (mtcars$vs, mtcars$am), identifiers
+# (morley$Expt, morley$Run) and calendar fields (airquality$Month,
+# airquality$Day) are left out because averaging them is meaningless.
+# -----------------------------------------------------------------------------
+attribute_catalog <- list(
+  airquality       = c("Ozone", "Solar.R", "Wind", "Temp"),
+  attitude         = c("rating", "complaints", "privileges", "learning", "raises", "critical", "advance"),
+  cars             = c("speed", "dist"),
+  ChickWeight      = c("weight", "Time"),
+  chickwts         = c("weight"),
+  CO2              = c("conc", "uptake"),
+  faithful         = c("eruptions", "waiting"),
+  InsectSprays     = c("count"),
+  iris             = c("Sepal.Length", "Sepal.Width", "Petal.Length", "Petal.Width"),
+  LifeCycleSavings = c("sr", "pop15", "pop75", "dpi", "ddpi"),
+  morley           = c("Speed"),
+  mtcars           = c("mpg", "cyl", "disp", "hp", "drat", "wt", "qsec", "gear", "carb"),
+  Orange           = c("age", "circumference"),
+  PlantGrowth      = c("weight"),
+  quakes           = c("lat", "long", "depth", "mag", "stations"),
+  rock             = c("area", "peri", "shape", "perm"),
+  stackloss        = c("Air.Flow", "Water.Temp", "Acid.Conc.", "stack.loss"),
+  swiss            = c("Fertility", "Agriculture", "Examination", "Education", "Catholic", "Infant.Mortality"),
+  ToothGrowth      = c("len", "dose"),
+  trees            = c("Girth", "Height", "Volume"),
+  USArrests        = c("Murder", "Assault", "UrbanPop", "Rape"),
+  warpbreaks       = c("breaks"),
+  women            = c("height", "weight")
+)
+
+# Alphabetical order that ignores case and does not depend on the session locale.
+attribute_catalog <- attribute_catalog[order(tolower(x = names(x = attribute_catalog)), method = "radix")]
+
+default_dataset <- "iris"
+
+reject_color <- "#c62828"
+fail_color <- "#1565c0"
+reference_color <- "#c62828"
+
+read_attribute <- function(dataset_name, attribute_name) {
+  table <- getExportedValue(ns = "datasets", name = dataset_name)
+  values <- table[[attribute_name]]
+  values[!is.na(x = values)]
+}
+
+# Stop at knit time if any catalog entry is not a usable quantitative attribute.
+for (dataset_name in names(x = attribute_catalog)) {
+  for (attribute_name in attribute_catalog[[dataset_name]]) {
+    values <- read_attribute(dataset_name = dataset_name, attribute_name = attribute_name)
+    stopifnot(is.numeric(x = values), length(x = unique(x = values)) >= 2)
+  }
+}
+
+greatest_common_divisor <- function(a, b) {
+  while (b > 0) {
+    remainder <- a %% b
+    a <- b
+    b <- remainder
+  }
+  a
+}
+
+# Spacing of the grid the values sit on (for example 2 for mtcars$cyl), or 0
+# when the values carry more than four decimal places.
+grid_spacing <- function(values) {
+  distinct <- sort(x = unique(x = values))
+  for (decimals in 0:4) {
+    scaled <- distinct * 10^decimals
+    if (all(abs(x = scaled - round(x = scaled)) < 1e-6)) {
+      steps <- diff(x = round(x = scaled))
+      return(Reduce(f = greatest_common_divisor, x = steps) / 10^decimals)
+    }
+  }
+  0
+}
+
+# The selected attribute is treated as the whole population.
+describe_population <- function(dataset_name, attribute_name) {
+  values <- as.numeric(x = read_attribute(dataset_name = dataset_name, attribute_name = attribute_name))
+  center <- mean(x = values)
+  spread <- sqrt(x = mean(x = (values - center)^2))   # population standard deviation (divisor N)
+  decimals <- min(6, max(0, 2 - floor(x = log10(x = spread))))   # three significant figures of sigma
+  step <- 10^(-decimals)
+  list(
+    dataset = dataset_name,
+    attribute = attribute_name,
+    values = values,
+    size = length(x = values),
+    mean = center,
+    standard_deviation = spread,
+    grid_spacing = grid_spacing(values = values),
+    grid_origin = min(values),
+    decimals = decimals,
+    step = step,
+    half_steps = ceiling(x = spread / step)   # the null-mean slider spans the true mean plus or minus about one sigma
+  )
+}
+```
+
+```{r plots, include = FALSE}
+# -----------------------------------------------------------------------------
+# Left plot: normal curve of the null distribution with a dot plot of the
+# sample means. The stacks are on the same density scale as the curve, and no
+# stack ever mixes "reject" (red) with "fail to reject" (blue) or crosses a
+# critical value.
+# -----------------------------------------------------------------------------
+draw_sample_means <- function(result) {
+  par(mar = c(4.3, 4.1, 2.8, 1.0), mex = 0.85, mgp = c(2.3, 0.45, 0), tcl = -0.25,
+      las = 1, xaxs = "i", yaxs = "i", cex.axis = 0.8)
+
+  standard_error <- result$standard_error
+  null_mean <- result$null_mean
+  true_mean <- result$true_mean
+  lower <- null_mean - result$margin
+  upper <- null_mean + result$margin
+  means <- result$sample_means
+  sample_count <- length(x = means)
+  peak <- dnorm(x = 0, mean = 0, sd = standard_error)
+  null_density <- function(x) dnorm(x = x, mean = null_mean, sd = standard_error)
+
+  x_min <- min(null_mean - 4.2 * standard_error, true_mean - 4.2 * standard_error, min(means))
+  x_max <- max(null_mean + 4.2 * standard_error, true_mean + 4.2 * standard_error, max(means))
+
+  plot.new()
+  region <- par()$pin   # width and height of the plotting region, in inches
+  y_guess <- 1.18 * peak
+
+  # Bin width that would make each dot cell square on screen.
+  target_width <- sqrt(x = (region[2] / region[1]) * (x_max - x_min) / (sample_count * y_guess))
+
+  # Side of each sample mean: -1 rejects below, 0 fails to reject, 1 rejects above.
+  side <- ifelse(test = !result$reject, yes = 0, no = ifelse(test = means < null_mean, yes = -1, no = 1))
+
+  # Sample means of a grid-valued attribute (for example mtcars$cyl) can only
+  # land on a grid of spacing (value spacing) / n.
+  spacing <- result$mean_spacing
+  origin <- result$mean_origin
+  per_bin <- if (spacing > 0) max(1, round(x = target_width / spacing)) else 0
+
+  if (per_bin >= 1 && per_bin <= 7) {
+    # Coarse grid: each bin holds whole grid points (per_bin of them, or one
+    # when the grid is wider than a dot), counted outward from the critical
+    # values. Only the last bin before the upper critical value can be short.
+    index <- round(x = (means - origin) / spacing)
+    first_inside <- floor(x = (lower - origin) / spacing) + 1
+    last_below <- first_inside - 1
+    first_above <- ceiling(x = (upper - origin) / spacing)
+    start <- ifelse(
+      test = side == 0,
+      yes = first_inside + per_bin * floor(x = (index - first_inside) / per_bin),
+      no = ifelse(
+        test = side < 0,
+        yes = last_below - per_bin * floor(x = (last_below - index) / per_bin) - (per_bin - 1),
+        no = first_above + per_bin * floor(x = (index - first_above) / per_bin)
+      )
+    )
+    finish <- ifelse(test = side == 0, yes = pmin(start + per_bin - 1, first_above - 1), no = start + per_bin - 1)
+    regular_width <- per_bin * spacing
+    width <- (finish - start + 1) * spacing
+    center <- origin + 0.5 * (start + finish) * spacing
+    bin <- paste(side, start)
+  } else {
+    # Fine grid or none: equal bins whose edges fall on both critical values.
+    # On a fine grid every bin holds (nearly) the same number of grid points.
+    preferred_width <- if (per_bin > 7) per_bin * spacing else target_width
+    inside <- round(x = (upper - lower) / preferred_width)
+    if (inside >= 1) {
+      regular_width <- (upper - lower) / inside
+      inside_width <- regular_width
+    } else {
+      # At low confidence levels the acceptance region is narrower than half a
+      # dot, so it becomes one narrow bin and the bins outside keep their width.
+      inside <- 1
+      regular_width <- preferred_width
+      inside_width <- upper - lower
+    }
+    index <- ifelse(
+      test = side == 0,
+      yes = pmin(pmax(floor(x = (means - lower) / inside_width), 0), inside - 1),
+      no = ifelse(
+        test = side < 0,
+        yes = pmin(ceiling(x = (means - lower) / regular_width) - 1, -1),   # counted down from the lower critical value
+        no = pmax(floor(x = (means - upper) / regular_width), 0)            # counted up from the upper critical value
+      )
+    )
+    width <- ifelse(test = side == 0, yes = inside_width, no = regular_width)
+    center <- ifelse(
+      test = side == 0,
+      yes = lower + (index + 0.5) * inside_width,
+      no = ifelse(test = side < 0, yes = lower + (index + 0.5) * regular_width, no = upper + (index + 0.5) * regular_width)
+    )
+    bin <- paste(side, index)
+  }
+
+  # A stack's height is the density of the sample means in its bin, so each
+  # dot carries 1 / (number of samples) of the area of its bin. A bin narrower
+  # than one column of dots (the acceptance region at low confidence levels)
+  # instead holds a single column of dots at the usual spacing, so a few
+  # samples there never tower over the curve. Stacks are wrapped into several
+  # narrow columns when a bin is much wider than one dot is tall, choosing the
+  # column count that keeps cells closest to square, and each stack is drawn
+  # only on its own side of the critical values.
+  x_min <- min(x_min, min(center - width))
+  x_max <- max(x_max, max(center + width))
+  side_start <- ifelse(test = side < 0, yes = -Inf, no = ifelse(test = side == 0, yes = lower, no = upper))
+  side_end <- ifelse(test = side < 0, yes = lower, no = ifelse(test = side == 0, yes = upper, no = Inf))
+  shown_left <- pmin(pmax(center - width / 2, side_start), side_end)
+  shown_right <- pmax(pmin(center + width / 2, side_end), shown_left)
+  shown_center <- (shown_left + shown_right) / 2
+  shown_width <- shown_right - shown_left
+  regular_height <- 1 / (sample_count * regular_width)
+  order_in_bin <- ave(x = seq_along(along.with = means), bin, FUN = seq_along) - 1
+  bin_size <- ave(x = seq_along(along.with = means), bin, FUN = length)
+  best_columns <- function(bin_width, dot_height, y_top) {
+    aspect <- (bin_width * region[1] / (x_max - x_min)) / (dot_height * region[2] / y_top)
+    fewer <- pmax(1, floor(x = sqrt(x = aspect)))
+    ifelse(test = aspect > fewer * (fewer + 1), yes = fewer + 1, no = fewer)
+  }
+  arrange_dots <- function(y_top) {
+    columns <- best_columns(bin_width = regular_width, dot_height = regular_height, y_top = y_top)
+    dot_height <- 1 / (sample_count * pmax(width, regular_width / columns))
+    bin_columns <- best_columns(bin_width = shown_width, dot_height = dot_height, y_top = y_top)
+    list(columns = columns, dot_height = dot_height, bin_columns = bin_columns,
+         top = max((order_in_bin %/% bin_columns + 1) * bin_columns * dot_height))
+  }
+  arrangement <- arrange_dots(y_top = y_guess)
+  y_max <- max(y_guess, 1.04 * arrangement$top)
+  arrangement <- arrange_dots(y_top = y_max)
+  y_max <- max(y_guess, 1.04 * arrangement$top)
+
+  columns <- arrangement$columns
+  bin_columns <- arrangement$bin_columns
+  dot_height <- arrangement$dot_height
+  row <- order_in_bin %/% bin_columns
+  column <- order_in_bin %% bin_columns
+  in_row <- pmin(bin_columns, bin_size - row * bin_columns)
+  sub_width <- shown_width / bin_columns
+  row_height <- bin_columns * dot_height
+  dot_x <- shown_center + (column + 0.5 - in_row / 2) * sub_width
+  dot_y <- (row + 0.5) * row_height
+  plot.window(xlim = c(x_min, x_max), ylim = c(0, y_max))
+
+  # The legend goes in the rightmost spot along the top that clears the curve
+  # and the dots. If no spot is clear, it goes where they are lowest and the
+  # plot grows taller to make room.
+  legend_text <- expression(epsilon == z[alpha / 2] * frac(sigma, sqrt(n)))
+  place_legend <- function(left, top, plot) {
+    legend(x = left, y = top, legend = legend_text, bty = "o", bg = "white", box.col = "grey70",
+           cex = 0.9, x.intersp = -0.5, y.intersp = 1.6, plot = plot)
+  }
+  content_top <- function(from, to) {
+    reach <- pmax(sub_width, regular_width / columns) / 2   # a dot in a narrow bin is wider than its bin
+    near <- dot_x + reach >= from & dot_x - reach <= to
+    grid <- seq(from = from, to = to, length.out = 40)
+    max(c(0, dot_y[near] + row_height[near] / 2, null_density(x = grid)))
+  }
+  box <- place_legend(left = x_min, top = y_max, plot = FALSE)$rect
+  pad_x <- 0.015 * (x_max - x_min)
+  lefts <- seq(from = x_max - pad_x - box$w, to = x_min + pad_x, length.out = 41)
+  tops <- vapply(X = lefts, FUN = function(left) content_top(from = left, to = left + box$w),
+                 FUN.VALUE = numeric(length = 1))
+  room_fraction <- (box$h / y_max) + 0.08   # legend height plus padding, as a share of the plot height
+  fits <- tops <= y_max * (1 - room_fraction)
+  best <- if (any(fits)) which(x = fits)[1] else which.min(x = tops)   # candidates run from right to left
+  if (tops[best] > y_max * (1 - room_fraction)) {
+    y_max <- tops[best] / (1 - room_fraction)
+    plot.window(xlim = c(x_min, x_max), ylim = c(0, y_max))
+  }
+
+  # Critical values, the null mean and (when different) the true mean.
+  segments(x0 = c(lower, upper), y0 = 0, x1 = c(lower, upper), y1 = y_max, col = "grey35", lwd = 1.3)
+  if (!result$null_is_true) {
+    segments(x0 = true_mean, y0 = 0, x1 = true_mean, y1 = y_max, col = "grey15", lwd = 1.3, lty = "dashed")
+  }
+  segments(x0 = null_mean, y0 = 0, x1 = null_mean, y1 = peak, col = "grey10", lwd = 1.3)
+
+  # Dot plot drawn as X marks that fill their cells, at most 1.5 times as
+  # wide as tall (or the reverse), never larger than 0.15 inch and never
+  # larger than in a full-width bin. A bin narrower than one cell keeps marks
+  # of the full cell width; marks wider than their bin overlap their
+  # neighbors, so they are drawn last, each over a white outline.
+  inches_per_x <- region[1] / (x_max - x_min)
+  inches_per_y <- region[2] / y_max
+  fit_mark <- function(cell_width_inches, cell_height_inches) {
+    list(half_width = pmin(0.36 * cell_width_inches, 1.5 * 0.36 * cell_height_inches, 0.075),
+         half_height = pmin(0.36 * cell_height_inches, 1.5 * 0.36 * cell_width_inches, 0.075))
+  }
+  cell_width <- regular_width / columns
+  regular_mark <- fit_mark(cell_width_inches = cell_width * inches_per_x,
+                           cell_height_inches = columns * regular_height * inches_per_y)
+  narrow <- shown_width < cell_width
+  own_mark <- fit_mark(cell_width_inches = ifelse(test = narrow, yes = cell_width, no = sub_width) * inches_per_x,
+                       cell_height_inches = row_height * inches_per_y)
+  half_width_inches <- pmin(own_mark$half_width, regular_mark$half_width)
+  half_height_inches <- pmin(own_mark$half_height, regular_mark$half_height)
+  half_x <- half_width_inches / inches_per_x
+  half_y <- half_height_inches / inches_per_y
+  mark_lwd <- max(0.7, min(1.8, 2 * min(regular_mark$half_width, regular_mark$half_height) * 96 / 5))
+  dot_color <- ifelse(test = result$reject, yes = reject_color, no = fail_color)
+  draw_marks <- function(keep, color, extra_lwd) {
+    segments(x0 = dot_x[keep] - half_x[keep], y0 = dot_y[keep] - half_y[keep],
+             x1 = dot_x[keep] + half_x[keep], y1 = dot_y[keep] + half_y[keep],
+             col = color, lwd = mark_lwd + extra_lwd)
+    segments(x0 = dot_x[keep] - half_x[keep], y0 = dot_y[keep] + half_y[keep],
+             x1 = dot_x[keep] + half_x[keep], y1 = dot_y[keep] - half_y[keep],
+             col = color, lwd = mark_lwd + extra_lwd)
+  }
+  overflowing <- 2 * half_x > shown_width
+  draw_marks(keep = !overflowing, color = dot_color[!overflowing], extra_lwd = 0)
+  draw_marks(keep = overflowing, color = "white", extra_lwd = 2.5)
+  draw_marks(keep = overflowing, color = dot_color[overflowing], extra_lwd = 0)
+
+  # Normal curve of the sample mean under the null hypothesis.
+  curve_x <- seq(from = x_min, to = x_max, length.out = 601)
+  lines(x = curve_x, y = null_density(x = curve_x), lwd = 2.2, col = "black")
+  segments(x0 = x_min, y0 = 0, x1 = x_max, y1 = 0, col = "black", lwd = 1)
+
+  # Labels for the vertical lines. When the critical values crowd together
+  # (low confidence levels), each label moves to the outside of its line.
+  bound_gap_inches <- (upper - lower) * inches_per_x
+  bound_width_inches <- strwidth(s = expression(mu[0] - epsilon), units = "inches", cex = 0.85) +
+    strwidth(s = expression(mu[0] + epsilon), units = "inches", cex = 0.85)
+  squeezed <- bound_gap_inches < 0.5 * bound_width_inches + 0.05
+  bound_nudge <- if (squeezed) 0.025 / inches_per_x else 0
+  mtext(text = expression(mu[0] - epsilon), side = 3, line = 0.15, at = lower - bound_nudge,
+        adj = if (squeezed) 1 else 0.5, cex = 0.85)
+  mtext(text = expression(mu[0] + epsilon), side = 3, line = 0.15, at = upper + bound_nudge,
+        adj = if (squeezed) 0 else 0.5, cex = 0.85)
+  if (result$null_is_true) {
+    mtext(text = expression(mu[0] == mu), side = 1, line = 0.2, at = null_mean, cex = 0.9)
+  } else {
+    gap_inches <- abs(x = true_mean - null_mean) * inches_per_x
+    width_inches <- strwidth(s = expression(mu[0]), units = "inches", cex = 0.9) +
+      strwidth(s = expression(mu), units = "inches", cex = 0.9)
+    crowded <- gap_inches < 0.5 * width_inches + 0.05
+    true_on_left <- true_mean < null_mean
+    nudge <- if (crowded) 0.025 / inches_per_x else 0   # keeps adjacent labels apart
+    true_adjust <- if (crowded) { if (true_on_left) 1 else 0 } else 0.5
+    null_adjust <- if (crowded) { if (true_on_left) 0 else 1 } else 0.5
+    true_at <- true_mean + if (true_on_left) -nudge else nudge
+    null_at <- null_mean + if (true_on_left) nudge else -nudge
+    mtext(text = expression(mu), side = 1, line = 0.2, at = true_at, adj = true_adjust, cex = 0.9)
+    mtext(text = expression(mu[0]), side = 1, line = 0.2, at = null_at, adj = null_adjust, cex = 0.9)
+  }
+
+  # Axes, titles and the legend for epsilon.
+  axis(side = 1, line = 1.25, mgp = c(0, 0.3, 0), tcl = -0.2)
+  mtext(text = bquote(expr = "Sample mean" ~ bar(x) ~ "of" ~ .(result$attribute_label)),
+        side = 1, line = 2.75, cex = 0.85)
+  axis(side = 2)
+  mtext(text = "Density", side = 2, line = 2.9, cex = 0.85, las = 0)
+  title(main = "Distribution of Sample Means", line = 1.45, cex.main = 0.95)
+  place_legend(left = lefts[best], top = y_max * 0.97, plot = TRUE)
+}
+
+# -----------------------------------------------------------------------------
+# Right plot: counts of each decision, with a dotted reference line at the
+# confidence level (true null) or the power (custom null).
+# -----------------------------------------------------------------------------
+draw_decisions <- function(result) {
+  par(mar = c(4.3, 4.6, 2.8, 1.0), mex = 0.85, mgp = c(2.6, 0.45, 0), tcl = -0.25,
+      las = 1, xaxs = "i", yaxs = "i", cex.axis = 0.8)
+
+  total <- length(x = result$reject)
+  reject_count <- sum(result$reject)
+  counts <- c(reject_count, total - reject_count)
+  centers <- c(0.95, 2.35)
+  x_range <- c(-0.45, 3.05)
+
+  plot.new()
+  plot.window(xlim = x_range, ylim = c(0, 1.14 * total))
+  rect(xleft = centers - 0.42, ybottom = 0, xright = centers + 0.42, ytop = counts,
+       col = "grey92", border = "grey15", lwd = 1.4)
+  segments(x0 = x_range[1], y0 = 0, x1 = x_range[2], y1 = 0, col = "black", lwd = 1)
+  ticks <- pretty(x = c(0, total))
+  axis(side = 2, at = ticks[ticks <= total])
+  mtext(text = "Number of samples", side = 2, line = 3.2, cex = 0.85, las = 0)
+
+  reference_y <- result$reference_rate * total
+  segments(x0 = x_range[1], y0 = reference_y, x1 = x_range[2], y1 = reference_y,
+           col = reference_color, lwd = 2.4, lty = "dotted")
+  text(x = x_range[1] + 0.06, y = reference_y, labels = result$reference_label,
+       adj = c(0, -0.45), col = reference_color, cex = 0.9)
+
+  mtext(text = c("Reject", "Fail to reject (FTR)"), side = 1, line = 0.4, at = centers, cex = 0.9)
+  percent_labels <- c(sprintf(fmt = "Reject  %.1f%%", 100 * counts[1] / total),
+                      sprintf(fmt = "Fail to reject  %.1f%%", 100 * counts[2] / total))
+  # Shrink the percentages when a narrow window would make them run together.
+  percent_cex <- 0.95
+  needed <- sum(strwidth(s = percent_labels, cex = percent_cex, font = 2)) / 2 + strwidth(s = "M", cex = percent_cex)
+  percent_cex <- percent_cex * min(1, diff(x = centers) / needed)
+  mtext(text = percent_labels, side = 1, line = 2.3, at = centers, cex = percent_cex, font = 2)
+  title(main = "Distribution of Test Decisions", line = 1.45, cex.main = 0.95)
+}
+```
+
+```{r interface, include = FALSE}
+# The widget is a self-contained Shiny app, so its fonts, math typesetting and
+# styles travel with it. Both the fonts (from the presentation's own files) and
+# MathJax (RStudio's copy, when RStudio is running) work without a network.
+fonts_directory <- system.file("rmd", "ioslides", "ioslides-13.5.1", "fonts", package = "rmarkdown")
+slide_fonts <- if (nzchar(x = fonts_directory)) {
+  htmltools::htmlDependency(name = "hypothesis-test-fonts", version = "13.5.1",
+                            src = c(file = fonts_directory), stylesheet = "fonts.css")
+}
+
+mathjax_directory <- Sys.getenv(x = "RMARKDOWN_MATHJAX_PATH")
+mathjax_source <- if (nzchar(x = mathjax_directory) && file.exists(file.path(mathjax_directory, "MathJax.js"))) {
+  addResourcePath(prefix = "hypothesis-test-mathjax", directoryPath = mathjax_directory)
+  "hypothesis-test-mathjax/MathJax.js?config=TeX-AMS-MML_HTMLorMML"
+} else {
+  "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"
+}
+
+hypothesis_test_styles <- r"---(
+html, body { margin: 0; background: #ffffff; }
+
+/* Fills the 1100 x 700 slide exactly; in a narrower window it shrinks to 860 pixels, then scrolls. */
+#HypothesisTest {
+  box-sizing: border-box;
+  width: calc(100% - 48px);
+  max-width: 1052px;
+  min-width: 860px;
+  height: 678px;
+  margin: 12px auto 0 auto;
+  display: flex;
+  flex-direction: column;
+  font-family: "Open Sans", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  color: #1f1f1f;
+}
+#HypothesisTest p { margin: 0; }
+#HypothesisTest .form-group { margin: 0; }
+#HypothesisTest .shiny-input-container { width: 100%; max-width: none; }
+#HypothesisTest label { font-size: 13px; color: #1f1f1f; margin-bottom: 0; }
+#HypothesisTest .control-label,
+#HypothesisTest .control-row-label { font-size: 14px; font-weight: 600; color: #1f1f1f; }
+#HypothesisTest .control-label { margin-bottom: 3px; }
+
+#HypothesisTest .section-heading {
+  color: #c62828;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+
+/* Top band: inputs on the right, dropdowns and the resample button on the left. */
+#HypothesisTest .controls-band {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  column-gap: 32px;
+  padding-bottom: 8px;
+  border-bottom: 2px solid #3a3a3a;
+}
+#HypothesisTest .dropdowns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  column-gap: 12px;
+  margin-bottom: 12px;
+}
+#HypothesisTest .dropdowns .selectize-input { font-size: 13px; padding: 5px 8px; min-height: 0; }
+#HypothesisTest .dropdowns .selectize-dropdown { font-size: 13px; }
+#HypothesisTest .resample-row .btn {
+  width: calc((100% - 12px) / 2);
+  padding: 5px 10px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+#HypothesisTest .controls-right { display: flex; flex-direction: column; row-gap: 3px; }
+#HypothesisTest .control-row {
+  display: grid;
+  grid-template-columns: 215px 1fr;
+  column-gap: 14px;
+  align-items: center;
+}
+#HypothesisTest .control-row .radio { margin: 1px 0; }
+#HypothesisTest .control-row .radio label { font-weight: 400; padding-left: 0; margin: 0; cursor: pointer; }
+#HypothesisTest .control-row .radio input[type="radio"] { position: static; margin: 0 7px 0 0; vertical-align: -2px; }
+
+/* The true mean sits at the center of the null-mean slider (within half a slider step). */
+#HypothesisTest .null-mean-slider { position: relative; padding-bottom: 15px; }
+#HypothesisTest .true-mean-marker {
+  position: absolute;
+  top: 34px;
+  left: 50%;
+  transform: translateX(-50%);
+  text-align: center;
+  line-height: 1;
+  pointer-events: none;
+}
+#HypothesisTest .true-mean-marker::before {
+  content: "";
+  display: block;
+  width: 2px;
+  height: 6px;
+  margin: 0 auto 2px auto;
+  background: #333333;
+}
+
+/* Middle band: the two plots, separated by a rule. */
+#HypothesisTest .plots-band {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border-bottom: 2px solid #3a3a3a;
+}
+#HypothesisTest .plot-panel { padding: 6px 8px 4px 8px; min-width: 0; }
+#HypothesisTest .plot-panel + .plot-panel { border-left: 2px solid #3a3a3a; }
+
+/* Bottom band: the learning corner. */
+#HypothesisTest .learning-corner { padding-top: 8px; }
+#HypothesisTest .learning-grid {
+  display: grid;
+  grid-template-columns: max-content max-content 1fr;
+  column-gap: 22px;
+  row-gap: 3px;
+}
+#HypothesisTest .learning-term { font-weight: 700; }
+)---"
+
+slider_row <- function(label, control) {
+  tags$div(class = "control-row", label, control)
+}
+
+hypothesis_test_interface <- bootstrapPage(
+  title = "HypothesisTest",
+  slide_fonts,
+  tags$head(
+    tags$style(HTML(text = hypothesis_test_styles)),
+    tags$script(src = mathjax_source)
+  ),
+  tags$div(
+    id = "HypothesisTest",
+    tags$div(
+      class = "controls-band",
+      tags$div(
+        class = "controls-left",
+        tags$div(
+          class = "dropdowns",
+          selectInput(inputId = "dataset", label = "Dataset", choices = names(x = attribute_catalog),
+                      selected = default_dataset, width = "100%"),
+          selectInput(inputId = "attribute", label = "Attribute", choices = attribute_catalog[[default_dataset]],
+                      selected = attribute_catalog[[default_dataset]][[1]], width = "100%")
+        ),
+        tags$div(
+          class = "resample-row",
+          actionButton(inputId = "resample", label = "Resample", icon = icon(name = "rotate"))
+        )
+      ),
+      tags$div(
+        class = "controls-right",
+        slider_row(
+          label = tags$label(class = "control-row-label", `for` = "confidence", "Confidence Level \\((1 - \\alpha)\\)"),
+          control = sliderInput(inputId = "confidence", label = NULL, min = 0.01, max = 0.99, value = 0.95,
+                                step = 0.01, ticks = FALSE, width = "100%")
+        ),
+        slider_row(
+          label = tags$label(class = "control-row-label", `for` = "sample_size", "Sample Size"),
+          control = sliderInput(inputId = "sample_size", label = NULL, min = 2, max = 500, value = 30,
+                                step = 1, ticks = FALSE, width = "100%")
+        ),
+        slider_row(
+          label = tags$label(class = "control-row-label", `for` = "sample_count", "Number of Samples"),
+          control = sliderInput(inputId = "sample_count", label = NULL, min = 10, max = 1000, value = 100,
+                                step = 10, ticks = FALSE, width = "100%")
+        ),
+        slider_row(
+          label = tags$span(class = "control-row-label", "Null Hypothesis"),
+          control = radioButtons(inputId = "null_type", label = NULL,
+                                 choices = c("True null" = "true", "Custom null" = "custom"),
+                                 selected = "true")
+        ),
+        slider_row(
+          label = tags$span(class = "control-row-label", "Null Mean \\(\\mu_0\\)"),
+          control = tags$div(
+            class = "null-mean-slider",
+            uiOutput(outputId = "null_slider_ui"),
+            tags$div(class = "true-mean-marker", "\\(\\mu\\)")
+          )
+        )
+      )
+    ),
+    tags$div(
+      class = "plots-band",
+      tags$div(class = "plot-panel", plotOutput(outputId = "sample_means_plot", width = "100%", height = "350px")),
+      tags$div(class = "plot-panel", plotOutput(outputId = "decision_plot", width = "100%", height = "350px"))
+    ),
+    tags$div(
+      class = "learning-corner",
+      tags$div(class = "section-heading", "Learning Corner"),
+      tags$div(
+        class = "learning-grid",
+        tags$span(class = "learning-term", "Type I Error"),
+        tags$span("Rejecting \\(H_0\\) when \\(H_0\\) is true."),
+        tags$span("\\(\\alpha =\\) false positive rate \\(\\;\\Longrightarrow\\;\\) \\(1 - \\alpha =\\) confidence level"),
+        tags$span(class = "learning-term", "Type II Error"),
+        tags$span("Failing to reject \\(H_0\\) when \\(H_0\\) is false."),
+        tags$span("\\(\\beta =\\) false negative rate \\(\\;\\Longrightarrow\\;\\) \\(1 - \\beta =\\) power")
+      )
+    )
+  )
+)
+```
+
+```{r server, include = FALSE}
+hypothesis_test_server <- function(input, output, session) {
+
+  # Keep the attribute when the new dataset has one with the same name.
+  observeEvent(eventExpr = input$dataset, handlerExpr = {
+    choices <- attribute_catalog[[input$dataset]]
+    req(!is.null(x = choices))
+    kept <- if (isTRUE(x = input$attribute %in% choices)) input$attribute else choices[[1]]
+    updateSelectInput(session = session, inputId = "attribute", choices = choices, selected = kept)
+  }, ignoreInit = TRUE)
+
+  # A population exists only for a dataset and an attribute that belong together.
+  current_population <- reactive(x = {
+    dataset_name <- input$dataset
+    attribute_name <- input$attribute
+    req(isTRUE(x = dataset_name %in% names(x = attribute_catalog)), cancelOutput = TRUE)
+    req(isTRUE(x = attribute_name %in% attribute_catalog[[dataset_name]]), cancelOutput = TRUE)
+    describe_population(dataset_name = dataset_name, attribute_name = attribute_name)
+  })
+
+  # New samples are drawn only when the population, sample size or number of
+  # samples changes, or when Resample is clicked; the confidence level and the
+  # null mean reuse them.
+  sample_bundle <- reactive(x = {
+    input$resample
+    population <- current_population()
+    sample_size <- input$sample_size
+    sample_count <- input$sample_count
+    req(is.numeric(x = sample_size), is.numeric(x = sample_count), cancelOutput = TRUE)
+    index <- sample.int(n = population$size, size = sample_size * sample_count, replace = TRUE)
+    draws <- matrix(data = population$values[index], nrow = sample_count, ncol = sample_size)
+    list(population = population, sample_size = sample_size, means = rowMeans(x = draws))
+  })
+
+  # The null-mean slider is rebuilt with a fresh input name whenever the
+  # population or the null choice changes, so a value left over from an earlier
+  # slider can never be read as the current null mean. It always starts at the
+  # true mean and is locked there while "True null" is selected.
+  null_slider_serial <- 0L
+  null_slider_spec <- reactive(x = {
+    population <- current_population()
+    null_type <- input$null_type
+    req(null_type %in% c("true", "custom"), cancelOutput = TRUE)
+    null_slider_serial <<- null_slider_serial + 1L
+    list(
+      id = paste0("null_mean_", null_slider_serial),
+      population = population,
+      locked = identical(x = null_type, y = "true")
+    )
+  })
+
+  output$null_slider_ui <- renderUI(expr = {
+    spec <- null_slider_spec()
+    population <- spec$population
+    half_range <- population$half_steps * population$step
+    # Rounded ends keep every slider value tidy; the true mean stays within half a step of the center.
+    slider <- sliderInput(inputId = spec$id, label = NULL,
+                          min = round(x = population$mean - half_range, digits = population$decimals),
+                          max = round(x = population$mean + half_range, digits = population$decimals),
+                          value = population$mean, step = population$step,
+                          ticks = FALSE, width = "100%")
+    htmltools::tagQuery(tags = slider)$find(cssSelector = "input")$addAttrs(
+      `data-disable` = if (spec$locked) "true" else "false",
+      `data-hide-min-max` = "true"
+    )$allTags()
+  })
+
+  test_result <- reactive(x = {
+    bundle <- sample_bundle()
+    population <- bundle$population
+    confidence <- input$confidence
+    req(is.numeric(x = confidence), cancelOutput = TRUE)
+
+    alpha <- 1 - confidence
+    standard_error <- population$standard_deviation / sqrt(x = bundle$sample_size)
+    critical_z <- qnorm(p = 1 - alpha / 2)
+    margin <- critical_z * standard_error
+
+    custom <- identical(x = input$null_type, y = "custom")
+    if (custom) {
+      spec <- null_slider_spec()
+      req(identical(x = spec$population$attribute, y = population$attribute),
+          identical(x = spec$population$dataset, y = population$dataset), cancelOutput = TRUE)
+      slider_value <- input[[spec$id]]
+      req(is.numeric(x = slider_value), cancelOutput = TRUE)
+      # The null mean lives on a grid of slider steps centered on the true mean.
+      offset_steps <- round(x = (slider_value - population$mean) / population$step)
+      offset_steps <- min(population$half_steps, max(-population$half_steps, offset_steps))
+    } else {
+      offset_steps <- 0
+    }
+    null_mean <- population$mean + offset_steps * population$step
+
+    reject <- abs(x = bundle$means - null_mean) >= margin
+    shift <- (population$mean - null_mean) / standard_error
+    power <- pnorm(q = -critical_z - shift) + pnorm(q = -critical_z + shift)
+
+    list(
+      sample_means = bundle$means,
+      mean_spacing = population$grid_spacing / bundle$sample_size,
+      mean_origin = population$grid_origin,
+      reject = reject,
+      null_mean = null_mean,
+      true_mean = population$mean,
+      null_is_true = offset_steps == 0,
+      margin = margin,
+      standard_error = standard_error,
+      attribute_label = paste0(population$attribute, " (", population$dataset, ")"),
+      reference_rate = if (custom) power else confidence,
+      reference_label = if (custom) {
+        bquote(expr = 1 - beta == .(formatC(x = power, format = "f", digits = 3)))
+      } else {
+        bquote(expr = 1 - alpha == .(formatC(x = confidence, format = "f", digits = 2)))
+      }
+    )
+  })
+
+  output$sample_means_plot <- renderPlot(expr = {
+    draw_sample_means(result = test_result())
+  }, width = "auto", height = 350, res = 96)
+
+  output$decision_plot <- renderPlot(expr = {
+    draw_decisions(result = test_result())
+  }, width = "auto", height = 350, res = 96)
+}
+```
+
+## {#HypothesisTest-slide}
+
+```{css, echo = FALSE}
+/* The widget fills the single slide, so the slide title, padding and counter are removed. */
+slides > slide { padding: 0; }
+slides > slide:not(.backdrop) { background: #ffffff; }
+slides > slide:not(.nobackground):after { content: none; }
+slides > slide > hgroup { display: none; }
+slides > slide > hgroup + article { margin-top: 0; height: 100%; }
+slides > slide > article > iframe.shiny-frame { display: block; width: 100%; height: 100%; border: 0; }
+```
+
+```{r widget}
+# Run Presentation shows this app inside the slide; Run All launches it on its own.
+shinyApp(ui = hypothesis_test_interface, server = hypothesis_test_server,
+         options = list(width = "100%", height = 700))
+```

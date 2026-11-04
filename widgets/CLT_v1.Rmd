@@ -1,0 +1,688 @@
+---
+title: "Central Limit Theorem"
+output:
+  ioslides_presentation:
+    widescreen: true
+runtime: shiny
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r populations, include = FALSE}
+# Attributes offered for each dataset in R's datasets package. Only attributes that can be averaged
+# are listed: factors, category codes (mtcars$vs, mtcars$am), and indices (airquality$Month,
+# airquality$Day, morley$Expt, morley$Run, ChickWeight$Time) are deliberately absent. A dataset that
+# is a single series (time series, named vector, the volcano matrix) contributes one attribute, named
+# after what its values measure.
+raw_attributes_by_dataset <- list(
+  AirPassengers = list(passengers = datasets::AirPassengers),
+  airquality = datasets::airquality[c("Ozone", "Solar.R", "Wind", "Temp")],
+  cars = datasets::cars[c("speed", "dist")],
+  ChickWeight = list(weight = datasets::ChickWeight$weight),
+  discoveries = list(discoveries = datasets::discoveries),
+  faithful = datasets::faithful[c("eruptions", "waiting")],
+  InsectSprays = datasets::InsectSprays["count"],
+  iris = datasets::iris[c("Sepal.Length", "Sepal.Width", "Petal.Length", "Petal.Width")],
+  islands = list(area = datasets::islands),
+  lynx = list(trappings = datasets::lynx),
+  morley = datasets::morley["Speed"],
+  mtcars = datasets::mtcars[c("mpg", "cyl", "disp", "hp", "drat", "wt", "qsec", "gear", "carb")],
+  Nile = list(flow = datasets::Nile),
+  precip = list(precipitation = datasets::precip),
+  pressure = datasets::pressure[c("temperature", "pressure")],
+  quakes = datasets::quakes[c("lat", "long", "depth", "mag", "stations")],
+  rivers = list(length = datasets::rivers),
+  sunspot.year = list(sunspots = datasets::sunspot.year),
+  swiss = datasets::swiss[c("Fertility", "Agriculture", "Examination", "Education", "Catholic", "Infant.Mortality")],
+  trees = datasets::trees[c("Girth", "Height", "Volume")],
+  USArrests = datasets::USArrests[c("Murder", "Assault", "UrbanPop", "Rape")],
+  volcano = list(height = datasets::volcano),
+  warpbreaks = datasets::warpbreaks["breaks"],
+  women = datasets::women[c("height", "weight")]
+)
+
+greatest_common_divisor <- function(first_integer, second_integer) {
+  while (second_integer > 0) {
+    remainder <- first_integer %% second_integer
+    first_integer <- second_integer
+    second_integer <- remainder
+  }
+  first_integer
+}
+
+# When every value equals minimum + k * unit for an integer k, the mean of n values equals
+# minimum + j * (unit / n) for an integer j. Histogram bins aligned to that grid hold equal numbers of
+# attainable means, which keeps discrete attributes from drawing comb-shaped histograms.
+# Returns 0 when no unit with at most six decimal places fits every value (treated as continuous).
+lattice_unit_of <- function(values) {
+  offsets <- values - min(values)
+  for (decimal_places in 0:6) {
+    scaled_offsets <- offsets * 10^decimal_places
+    # Above 2^52 a double has no fractional part left to test, so no lattice can be detected.
+    if (max(scaled_offsets) > 2^52) {
+      break
+    }
+    integer_offsets <- round(x = scaled_offsets)
+    if (all(abs(x = scaled_offsets - integer_offsets) < 1e-6) && any(integer_offsets > 0)) {
+      return(Reduce(f = greatest_common_divisor, x = integer_offsets[integer_offsets > 0]) / 10^decimal_places)
+    }
+  }
+  0
+}
+
+# Mean and standard deviation with divisor N (the values are the entire population being sampled),
+# computed on values scaled by their largest magnitude so that neither can overflow.
+population_moments <- function(values) {
+  largest_magnitude <- max(abs(x = values))
+  if (largest_magnitude == 0) {
+    return(list(mean = 0, standard_deviation = 0))
+  }
+  scaled_values <- values / largest_magnitude
+  scaled_mean <- mean(x = scaled_values)
+  list(
+    mean = largest_magnitude * scaled_mean,
+    standard_deviation = largest_magnitude * sqrt(x = mean(x = (scaled_values - scaled_mean)^2))
+  )
+}
+
+# Describes why values cannot form a population, or returns NULL when they can. A population needs at
+# least two values, all finite, small enough that a sum of 100 of them stays finite, and a spread
+# large enough to draw, both in absolute terms and relative to the values' size (double precision
+# carries about 16 significant digits).
+population_problem <- function(values) {
+  if (length(x = values) < 2L) {
+    return("has fewer than two values")
+  }
+  if (!all(is.finite(x = values))) {
+    return("has values that are not finite")
+  }
+  if (max(abs(x = values)) > 1e300) {
+    return("has values too large to average")
+  }
+  standard_deviation <- population_moments(values = values)$standard_deviation
+  if (standard_deviation == 0) {
+    return("has the same value everywhere, so its sample means cannot vary")
+  }
+  if (standard_deviation < 1e-290) {
+    return("varies too little to draw")
+  }
+  if (standard_deviation < 1e-7 * max(abs(x = values))) {
+    return("varies too little relative to its size to draw precisely")
+  }
+  NULL
+}
+
+# The only constructor for a population, so every population satisfies the invariants above.
+make_population <- function(dataset_name, attribute_name, values) {
+  problem <- population_problem(values = values)
+  if (!is.null(problem)) {
+    stop(errorCondition(message = paste0(dataset_name, "$", attribute_name, " ", problem, "."), call = NULL))
+  }
+  moments <- population_moments(values = values)
+  list(
+    dataset_name = dataset_name,
+    attribute_name = attribute_name,
+    values = values,
+    mean = moments$mean,
+    standard_deviation = moments$standard_deviation,
+    lattice_unit = lattice_unit_of(values = values)
+  )
+}
+
+population_key <- function(dataset_name, attribute_name) {
+  paste0(dataset_name, "$", attribute_name)
+}
+
+population_catalog <- list()
+for (dataset_name in names(x = raw_attributes_by_dataset)) {
+  for (attribute_name in names(x = raw_attributes_by_dataset[[dataset_name]])) {
+    attribute_values <- as.numeric(x = raw_attributes_by_dataset[[dataset_name]][[attribute_name]])
+    population_catalog[[population_key(dataset_name = dataset_name, attribute_name = attribute_name)]] <- make_population(
+      dataset_name = dataset_name,
+      attribute_name = attribute_name,
+      # Missing values (airquality has them) are not part of the population.
+      values = attribute_values[!is.na(x = attribute_values)]
+    )
+  }
+}
+
+dataset_names <- names(x = raw_attributes_by_dataset)
+dataset_names <- dataset_names[order(tolower(x = dataset_names), method = "radix")]
+
+# Attribute dropdown choices per dataset: each label is an attribute name and each value is the key of
+# that attribute's population, so a selected attribute always identifies exactly one population.
+attribute_choices_by_dataset <- lapply(
+  X = stats::setNames(object = dataset_names, nm = dataset_names),
+  FUN = function(dataset_name) {
+    attribute_names <- names(x = raw_attributes_by_dataset[[dataset_name]])
+    stats::setNames(
+      object = population_key(dataset_name = dataset_name, attribute_name = attribute_names),
+      nm = attribute_names
+    )
+  }
+)
+```
+
+```{r transform, include = FALSE}
+# Names a transform formula may use besides x. Any other name is rejected before evaluation, and
+# evaluation happens in an environment holding only these names, so a formula can compute but cannot
+# act: no assignment, no files, no system calls, no access to other objects.
+formula_base_names <- c(
+  "(", "+", "-", "*", "/", "^", "%%", "%/%",
+  "<", ">", "<=", ">=", "==", "!=", "&", "|", "!", "ifelse",
+  "abs", "sign", "sqrt", "exp", "expm1", "log", "log10", "log2", "log1p",
+  "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinpi", "cospi", "tanpi",
+  "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+  "floor", "ceiling", "round", "signif", "trunc",
+  "gamma", "lgamma", "beta", "lbeta", "choose", "lchoose", "factorial", "lfactorial",
+  "pmin", "pmax", "min", "max", "sum", "mean", "length", "rank"
+)
+formula_stats_names <- c("median", "sd", "var", "pnorm", "qnorm", "plogis", "qlogis")
+formula_bindings <- c(
+  mget(x = formula_base_names, envir = baseenv()),
+  mget(x = formula_stats_names, envir = asNamespace(ns = "stats")),
+  list(pi = pi, T = TRUE, F = FALSE)
+)
+
+formula_problem <- function(message) {
+  stop(errorCondition(message = message, class = "formula_problem", call = NULL))
+}
+
+# Applies y = f(x) to every value x of a population. Returns the transformed population, or signals a
+# formula_problem condition whose message says what to fix.
+transform_population <- function(population, formula_text) {
+  if (!is.character(x = formula_text) || length(x = formula_text) != 1L || !nzchar(x = trimws(x = formula_text))) {
+    formula_problem(message = "Type a formula in x, such as log(x + 1).")
+  }
+  parsed <- tryCatch(expr = parse(text = formula_text, keep.source = FALSE), error = function(condition) NULL)
+  if (is.null(parsed)) {
+    formula_problem(message = "The formula is not valid R code.")
+  }
+  if (length(x = parsed) != 1L) {
+    formula_problem(message = "The formula must be a single expression in x.")
+  }
+  formula_expression <- parsed[[1L]]
+  # "y ~ log(x)" and "~ log(x)" are read the same as "log(x)".
+  if (is.call(x = formula_expression) && identical(x = formula_expression[[1L]], y = as.name(x = "~"))) {
+    if (length(x = formula_expression) == 2L) {
+      formula_expression <- formula_expression[[2L]]
+    } else if (identical(x = formula_expression[[2L]], y = as.name(x = "y"))) {
+      formula_expression <- formula_expression[[3L]]
+    } else {
+      formula_problem(message = "The left side of the formula must be y.")
+    }
+  }
+  used_names <- all.names(expr = formula_expression, unique = TRUE)
+  unavailable_names <- setdiff(x = used_names, y = c("x", names(x = formula_bindings)))
+  if (length(x = unavailable_names) > 0L) {
+    formula_problem(message = paste0(
+      "`", unavailable_names[[1L]], "`",
+      " is not available in formulas. Use x, numbers, pi, arithmetic, and functions such as log, exp, sqrt, and abs."
+    ))
+  }
+  if (!("x" %in% used_names)) {
+    formula_problem(message = "The formula must use x.")
+  }
+
+  sandbox <- list2env(x = c(formula_bindings, list(x = population$values)), parent = emptyenv())
+  result <- tryCatch(
+    expr = withCallingHandlers(
+      expr = eval(expr = formula_expression, envir = sandbox),
+      # Warnings such as "NaNs produced" are superseded by the finiteness check below.
+      warning = function(condition) invokeRestart(r = "muffleWarning")
+    ),
+    error = function(condition) {
+      formula_problem(message = paste0("R could not evaluate the formula: ", conditionMessage(c = condition)))
+    }
+  )
+  if (!(is.numeric(x = result) || is.logical(x = result))) {
+    formula_problem(message = "The formula must produce numbers.")
+  }
+  if (length(x = result) != length(x = population$values)) {
+    formula_problem(message = "The formula must produce one value for each value of x.")
+  }
+  transformed_values <- as.numeric(x = result)
+  undefined <- !is.finite(x = transformed_values)
+  if (any(undefined)) {
+    formula_problem(message = sprintf(
+      fmt = "The formula is undefined or infinite for %d of %d values of x, for example x = %s.",
+      sum(undefined),
+      length(x = undefined),
+      format(x = population$values[which(x = undefined)[[1L]]], digits = 6)
+    ))
+  }
+  problem <- population_problem(values = transformed_values)
+  if (!is.null(problem)) {
+    formula_problem(message = paste0("The transformed attribute ", problem, "."))
+  }
+  # The transformed attribute is named by the formula with x replaced by the attribute's name.
+  named_expression <- do.call(
+    what = substitute,
+    args = list(expr = formula_expression, env = list(x = as.name(x = population$attribute_name)))
+  )
+  make_population(
+    dataset_name = population$dataset_name,
+    attribute_name = paste(deparse(expr = named_expression, width.cutoff = 500L), collapse = " "),
+    values = transformed_values
+  )
+}
+```
+
+```{r sampling, include = FALSE}
+# Every sample draws sample_size values independently and with replacement, so each sample mean has
+# expectation mu and standard deviation sigma / sqrt(n) exactly.
+simulate_sample_means <- function(population, sample_size, number_of_samples) {
+  draw_indices <- sample.int(n = length(x = population$values), size = sample_size * number_of_samples, replace = TRUE)
+  samples <- matrix(data = population$values[draw_indices], nrow = number_of_samples, ncol = sample_size)
+  list(
+    population = population,
+    sample_size = sample_size,
+    number_of_samples = number_of_samples,
+    sample_means = rowMeans(x = samples),
+    most_recent_sample = samples[number_of_samples, ],
+    standard_error = population$standard_deviation / sqrt(x = sample_size)
+  )
+}
+
+# Histogram bins for the sample means. The target width is Scott's normal reference rule evaluated at
+# the known standard deviation of the sample mean, narrowed when needed so that a small number of
+# samples still spreads over at least five bins. On a lattice, the width becomes a whole number of
+# lattice steps and every edge sits halfway between attainable means; otherwise a bin is centered on mu.
+sample_mean_bins <- function(simulation) {
+  minimum_number_of_bins <- 5
+  maximum_number_of_bins <- 200
+  population <- simulation$population
+  sample_means <- simulation$sample_means
+  span_of_means <- max(sample_means) - min(sample_means)
+  target_width <- 3.49 * simulation$standard_error * simulation$number_of_samples^(-1 / 3)
+  if (span_of_means > 0) {
+    target_width <- min(target_width, span_of_means / minimum_number_of_bins)
+  }
+  lattice_spacing <- population$lattice_unit / simulation$sample_size
+  if (lattice_spacing > 0) {
+    steps_per_bin <- max(
+      1,
+      round(x = target_width / lattice_spacing),
+      ceiling(x = span_of_means / (maximum_number_of_bins * lattice_spacing))
+    )
+    bin_width <- steps_per_bin * lattice_spacing
+    lattice_origin <- min(population$values)
+    step_nearest_mean <- round(x = (population$mean - lattice_origin) / lattice_spacing)
+    reference_edge <- lattice_origin + (step_nearest_mean - floor(x = (steps_per_bin - 1) / 2) - 0.5) * lattice_spacing
+  } else {
+    bin_width <- max(target_width, span_of_means / maximum_number_of_bins)
+    reference_edge <- population$mean - bin_width / 2
+  }
+  first_edge <- reference_edge + bin_width * floor(x = (min(sample_means) - reference_edge) / bin_width)
+  number_of_bins <- max(1, ceiling(x = (max(sample_means) - first_edge) / bin_width))
+  edges <- first_edge + bin_width * (0:number_of_bins)
+  bin_of_each_mean <- findInterval(x = sample_means, vec = edges, all.inside = TRUE)
+  counts <- tabulate(bin = bin_of_each_mean, nbins = number_of_bins)
+  list(
+    edges = edges,
+    bin_width = bin_width,
+    densities = counts / (length(x = sample_means) * bin_width)
+  )
+}
+```
+
+```{r drawing, include = FALSE}
+# Plots are drawn on a transparent background over the white slide; "surface" is the slide color, used
+# for the gaps between bars and the rings around points.
+widget_colors <- list(
+  surface = "#ffffff",
+  primary_ink = "#0b0b0b",
+  secondary_ink = "#52514e",
+  baseline = "#c3c2b7",
+  sample_fill = "#cfcdc6",
+  sample_point = "#6f6d67",
+  population_mean = "#e34948",
+  standard_deviation = "#2a78d6"
+)
+
+as_plot_label <- function(label) {
+  if (nzchar(x = label)) latex2exp::TeX(input = label) else ""
+}
+
+# Labels for the lines at mu + k * sigma / sqrt(n), from most to least descriptive. Each plot uses the
+# first set whose widest label fits in 80 percent of the gap between neighboring lines, so labels never
+# overlap; the last set labels mu alone.
+standard_deviation_label_sets <- lapply(
+  X = list(
+    c(r"($\mu - 2\sigma/\sqrt{n}$)", r"($\mu - \sigma/\sqrt{n}$)", r"($\mu$)", r"($\mu + \sigma/\sqrt{n}$)", r"($\mu + 2\sigma/\sqrt{n}$)"),
+    c(r"($-2\sigma/\sqrt{n}$)", r"($-\sigma/\sqrt{n}$)", r"($\mu$)", r"($+\sigma/\sqrt{n}$)", r"($+2\sigma/\sqrt{n}$)"),
+    c(r"($-2$)", r"($-1$)", r"($\mu$)", r"($+1$)", r"($+2$)"),
+    c("", "", r"($\mu$)", "", "")
+  ),
+  FUN = function(labels) lapply(X = labels, FUN = as_plot_label)
+)
+
+# Plain numbers for ordinary magnitudes; scientific notation, with enough digits to tell neighboring
+# ticks apart, for the very large or very small magnitudes a transform can produce.
+format_tick_labels <- function(ticks) {
+  nonzero_magnitudes <- abs(x = ticks[ticks != 0])
+  if (length(x = nonzero_magnitudes) == 0L || (max(nonzero_magnitudes) < 1e15 && min(nonzero_magnitudes) >= 1e-6)) {
+    return(format(x = ticks, big.mark = ",", scientific = FALSE, trim = TRUE, drop0trailing = TRUE))
+  }
+  tick_step <- if (length(x = ticks) > 1L) min(diff(x = sort(x = ticks))) else max(nonzero_magnitudes)
+  significant_digits <- min(15, max(1, ceiling(x = log10(x = max(nonzero_magnitudes) / tick_step)) + 1))
+  format(x = ticks, scientific = TRUE, digits = significant_digits, trim = TRUE, drop0trailing = TRUE)
+}
+
+# A zero-width range (for example, a sample whose values are all equal) is widened so it can be drawn.
+widen_degenerate_limits <- function(limits) {
+  if (diff(x = limits) > 0) {
+    return(limits)
+  }
+  limits + c(-1, 1) * max(0.1 * abs(x = limits[1]), 0.5)
+}
+
+# Opens a plot whose left margin fits the widest horizontal y tick label and whose right margin fits
+# the rightmost x tick label, then draws both axes and their titles. y_axis_style "i" starts the bars
+# exactly at the baseline; "r" pads the range by 4 percent. The x range is always padded by 4 percent.
+open_plot <- function(x_limits, y_limits, y_axis_style, x_title, y_title, top_margin_lines) {
+  x_limits <- widen_degenerate_limits(limits = x_limits)
+  y_limits <- widen_degenerate_limits(limits = y_limits)
+  axis_cex <- 0.85
+  inches_per_margin_line <- graphics::par("csi") * graphics::par("mex")
+  label_lines <- function(labels) graphics::strwidth(s = labels, units = "inches", cex = axis_cex) / inches_per_margin_line
+
+  y_padding <- if (identical(x = y_axis_style, y = "r")) 0.04 * diff(x = y_limits) else 0
+  y_ticks <- grDevices::axisTicks(usr = y_limits + c(-1, 1) * y_padding, log = FALSE)
+  y_tick_labels <- format_tick_labels(ticks = y_ticks)
+  y_title_line <- 0.55 + max(label_lines(labels = y_tick_labels)) + 0.6
+  left_margin_lines <- y_title_line + 1.2
+
+  x_axis_range <- x_limits + c(-1, 1) * 0.04 * diff(x = x_limits)
+  x_ticks <- grDevices::axisTicks(usr = x_axis_range, log = FALSE)
+  x_tick_labels <- format_tick_labels(ticks = x_ticks)
+  plot_width_lines <- graphics::par("fin")[1] / inches_per_margin_line - left_margin_lines - 0.8
+  last_tick_to_edge_lines <- (x_axis_range[2] - max(x_ticks)) / diff(x = x_axis_range) * plot_width_lines
+  right_margin_lines <- max(0.8, label_lines(labels = x_tick_labels[length(x = x_tick_labels)]) / 2 - last_tick_to_edge_lines + 0.3)
+
+  graphics::par(
+    mar = c(3.4, left_margin_lines, top_margin_lines, right_margin_lines),
+    mgp = c(2.2, 0.55, 0),
+    las = 1,
+    tcl = -0.3,
+    bg = "transparent"
+  )
+  graphics::plot.new()
+  graphics::plot.window(xlim = x_limits, ylim = y_limits, yaxs = y_axis_style)
+  axis_style <- list(
+    col = widget_colors$baseline,
+    col.ticks = widget_colors$baseline,
+    col.axis = widget_colors$secondary_ink,
+    lwd = 1,
+    cex.axis = axis_cex
+  )
+  do.call(what = graphics::axis, args = c(list(side = 1, at = x_ticks, labels = x_tick_labels), axis_style))
+  do.call(what = graphics::axis, args = c(list(side = 2, at = y_ticks, labels = y_tick_labels), axis_style))
+  graphics::title(xlab = x_title, col.lab = widget_colors$secondary_ink, cex.lab = 0.95)
+  graphics::title(ylab = y_title, line = y_title_line, col.lab = widget_colors$secondary_ink, cex.lab = 0.95)
+}
+
+draw_sampling_distribution <- function(simulation) {
+  population <- simulation$population
+  standard_error <- simulation$standard_error
+  bins <- sample_mean_bins(simulation = simulation)
+  number_of_bins <- length(x = bins$densities)
+  x_limits <- range(bins$edges, population$mean + c(-3.5, 3.5) * standard_error)
+  curve_x <- seq(from = x_limits[1], to = x_limits[2], length.out = 501L)
+  curve_density <- stats::dnorm(x = curve_x, mean = population$mean, sd = standard_error)
+  y_limits <- c(0, 1.06 * max(bins$densities, curve_density))
+  line_offsets <- -2:2
+  line_positions <- population$mean + line_offsets * standard_error
+  label_cex <- 0.85
+
+  open_plot(
+    x_limits = x_limits,
+    y_limits = y_limits,
+    y_axis_style = "i",
+    x_title = population$attribute_name,
+    y_title = "Density",
+    top_margin_lines = 1.6
+  )
+
+  # A surface-colored gap separates adjacent bars when the bars are wide enough to keep it.
+  pixels_per_unit <- abs(x = diff(x = graphics::grconvertX(x = x_limits, from = "user", to = "device"))) / diff(x = x_limits)
+  bar_pixels <- bins$bin_width * pixels_per_unit
+  graphics::rect(
+    xleft = bins$edges[-(number_of_bins + 1L)],
+    ybottom = 0,
+    xright = bins$edges[-1L],
+    ytop = bins$densities,
+    col = widget_colors$sample_fill,
+    border = if (bar_pixels >= 6) widget_colors$surface else NA,
+    lwd = if (bar_pixels >= 10) 2 else 1
+  )
+  graphics::segments(
+    x0 = line_positions[line_offsets != 0],
+    y0 = 0,
+    x1 = line_positions[line_offsets != 0],
+    y1 = y_limits[2],
+    col = widget_colors$standard_deviation,
+    lwd = 1.5
+  )
+  graphics::segments(
+    x0 = population$mean,
+    y0 = 0,
+    x1 = population$mean,
+    y1 = y_limits[2],
+    col = widget_colors$population_mean,
+    lwd = 2,
+    lty = "dashed"
+  )
+  graphics::lines(x = curve_x, y = curve_density, col = widget_colors$primary_ink, lwd = 2)
+  graphics::abline(h = 0, col = widget_colors$baseline, lwd = 1)
+
+  label_width <- function(label) graphics::strwidth(s = label, units = "user", cex = label_cex)
+  chosen_labels <- standard_deviation_label_sets[[length(x = standard_deviation_label_sets)]]
+  for (label_set in standard_deviation_label_sets) {
+    if (max(vapply(X = label_set, FUN = label_width, FUN.VALUE = numeric(length = 1L))) <= 0.8 * standard_error) {
+      chosen_labels <- label_set
+      break
+    }
+  }
+  for (index in seq_along(along.with = line_positions)) {
+    graphics::mtext(
+      text = chosen_labels[[index]],
+      side = 3,
+      at = line_positions[index],
+      line = 0.3,
+      cex = label_cex,
+      col = widget_colors$secondary_ink
+    )
+  }
+}
+
+draw_most_recent_sample <- function(simulation) {
+  sample_values <- simulation$most_recent_sample
+  quantile_pairs <- stats::qqnorm(y = sample_values, plot.it = FALSE)
+
+  open_plot(
+    x_limits = range(quantile_pairs$x),
+    y_limits = range(quantile_pairs$y),
+    y_axis_style = "r",
+    x_title = "Theoretical Quantiles",
+    y_title = "Sample Quantiles",
+    top_margin_lines = 0.8
+  )
+  # Reference line through the first and third quartiles, as in stats::qqline.
+  stats::qqline(y = sample_values, col = widget_colors$primary_ink, lwd = 2)
+  graphics::points(
+    x = quantile_pairs$x,
+    y = quantile_pairs$y,
+    pch = 21,
+    bg = widget_colors$sample_point,
+    col = widget_colors$surface,
+    lwd = 1,
+    cex = 1.1
+  )
+}
+```
+
+```{r widget_definition, include = FALSE}
+widget_interface <- shiny::fluidPage(
+  shiny::tags$head(
+    shiny::tags$link(rel = "stylesheet", href = "https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600&display=swap"),
+    shiny::tags$style(shiny::HTML(text = "
+      html, body { background: transparent; }
+      body { font-family: 'Open Sans', Arial, sans-serif; color: #0b0b0b; }
+      .control-label { font-weight: 600; }
+      .form-group { margin-bottom: 6px; }
+      .checkbox { margin-top: 4px; margin-bottom: 4px; }
+      .formula-row { display: flex; align-items: center; gap: 8px; margin: 2px 0 0 20px; }
+      .formula-row > label { margin: 0; font-weight: 400; white-space: nowrap; }
+      .formula-row > .form-group { flex: 1 1 auto; margin: 0; }
+      .formula-row input { height: 30px; padding: 4px 8px; font-family: Menlo, Consolas, 'Liberation Mono', monospace; }
+      .formula-row.is-disabled > label, .formula-row.is-disabled input { color: #b0afa9; }
+      .display-area { display: flex; gap: 24px; align-items: flex-start; border-top: 1px solid #e1e0d9; margin-top: 4px; padding-top: 4px; }
+      .display-area > .main-panel { flex: 1 1 0; min-width: 0; }
+      .display-area > .side-panel { flex: 0 0 300px; }
+      .display-area h3 { font-size: 20px; font-weight: 600; margin: 4px 0 2px 0; }
+      .display-area h4 { font-size: 15px; font-weight: 600; margin: 8px 0 4px 0; }
+    ")),
+    # The formula row is greyed out and locked whenever Apply Transform is unchecked. The formula box
+    # holds code, so the browser neither spell-checks nor autocompletes it.
+    shiny::tags$script(shiny::HTML(text = "
+      $(function() {
+        function synchronizeFormulaRow() {
+          var transformApplied = $('#apply_transform').prop('checked');
+          $('#transform_formula').prop('disabled', !transformApplied);
+          $('.formula-row').toggleClass('is-disabled', !transformApplied);
+        }
+        $('#transform_formula').attr({ autocomplete: 'off', spellcheck: 'false' });
+        $(document).on('change', '#apply_transform', synchronizeFormulaRow);
+        synchronizeFormulaRow();
+      });
+    "))
+  ),
+  # Native dropdowns (selectize = FALSE) always hold a selection, so neither can be emptied.
+  shiny::fluidRow(
+    shiny::column(
+      width = 3,
+      shiny::selectInput(
+        inputId = "dataset",
+        label = "Dataset",
+        choices = dataset_names,
+        selected = dataset_names[[1L]],
+        selectize = FALSE,
+        width = "100%"
+      )
+    ),
+    shiny::column(
+      width = 3,
+      shiny::selectInput(
+        inputId = "attribute",
+        label = "Attribute",
+        choices = attribute_choices_by_dataset[[dataset_names[[1L]]]],
+        selectize = FALSE,
+        width = "100%"
+      )
+    ),
+    shiny::column(
+      width = 6,
+      shiny::sliderInput(inputId = "sample_size", label = "Sample Size", min = 1, max = 100, value = 10, step = 1, ticks = FALSE, width = "100%"),
+      shiny::sliderInput(inputId = "number_of_samples", label = "Number of Samples", min = 10, max = 10000, value = 1000, step = 10, ticks = FALSE, width = "100%"),
+      shiny::checkboxInput(inputId = "show_quantile_quantile", label = "QQ", value = FALSE),
+      shiny::checkboxInput(inputId = "apply_transform", label = "Apply Transform", value = FALSE),
+      shiny::div(
+        class = "formula-row is-disabled",
+        shiny::tags$label(`for` = "transform_formula", "Formula: y~"),
+        shiny::textInput(inputId = "transform_formula", label = NULL, value = "log(x)", width = "100%")
+      )
+    )
+  ),
+  # The quantile-quantile panel takes a fixed width beside the main panel while its checkbox is checked;
+  # otherwise the main panel spans the whole display area.
+  shiny::div(
+    class = "display-area",
+    shiny::div(
+      class = "main-panel",
+      shiny::tags$h3("Distribution of Sample Means"),
+      shiny::plotOutput(outputId = "sampling_distribution", height = "340px")
+    ),
+    shiny::conditionalPanel(
+      condition = "input.show_quantile_quantile",
+      class = "side-panel",
+      shiny::tags$h4("QQ-Plot (Most Recent Sample)"),
+      shiny::plotOutput(outputId = "most_recent_sample", height = "250px")
+    )
+  )
+)
+
+widget_server <- function(input, output, session) {
+  shiny::observeEvent(eventExpr = input$dataset, ignoreInit = TRUE, handlerExpr = {
+    shiny::req(input$dataset %in% dataset_names)
+    attribute_choices <- attribute_choices_by_dataset[[input$dataset]]
+    shiny::updateSelectInput(session = session, inputId = "attribute", choices = attribute_choices, selected = attribute_choices[[1L]])
+  })
+
+  # The formula is read once typing pauses, so half-typed formulas are not evaluated.
+  formula_text <- shiny::debounce(r = shiny::reactive(x = input$transform_formula), millis = 600)
+
+  # The selected attribute's population, transformed by the formula while Apply Transform is checked.
+  # A formula that cannot produce a valid population replaces both plots with a message saying why.
+  population <- shiny::reactive(x = {
+    shiny::req(input$attribute %in% names(x = population_catalog))
+    attribute_population <- population_catalog[[input$attribute]]
+    if (!isTRUE(x = input$apply_transform)) {
+      return(attribute_population)
+    }
+    outcome <- tryCatch(
+      expr = transform_population(population = attribute_population, formula_text = formula_text()),
+      formula_problem = function(condition) condition
+    )
+    if (inherits(x = outcome, what = "formula_problem")) {
+      shiny::validate(conditionMessage(c = outcome))
+    }
+    outcome
+  })
+
+  simulation <- shiny::reactive(x = {
+    shiny::req(input$sample_size, input$number_of_samples)
+    simulate_sample_means(
+      population = population(),
+      sample_size = as.integer(x = input$sample_size),
+      number_of_samples = as.integer(x = input$number_of_samples)
+    )
+  })
+
+  # Both plots size their labels and margins to the drawing area, so they are redrawn, not rescaled,
+  # when the main plot widens or narrows as the quantile-quantile checkbox is toggled.
+  output$sampling_distribution <- shiny::renderPlot(
+    expr = draw_sampling_distribution(simulation = simulation()),
+    res = 96,
+    execOnResize = TRUE,
+    bg = "transparent"
+  )
+  output$most_recent_sample <- shiny::renderPlot(
+    expr = draw_most_recent_sample(simulation = simulation()),
+    res = 96,
+    execOnResize = TRUE,
+    bg = "transparent"
+  )
+}
+```
+
+## {#widget}
+
+```{css}
+/* The widget fills the whole content area of its untitled slide. */
+slides > slide > hgroup + article#widget {
+  margin-top: 0;
+  height: 100%;
+}
+article#widget > iframe.shiny-frame {
+  height: 100%;
+  border: 0;
+  background: transparent;
+}
+```
+
+```{r widget}
+shiny::shinyApp(ui = widget_interface, server = widget_server, options = list(width = "100%", height = 620))
+```
